@@ -13,18 +13,11 @@
 
 FROM python:3.11-slim
 
-# install system deps: google-cloud-sdk (gsutil) + opencv deps
+# install system deps: opencv deps & curl (untuk download model)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
-        gnupg \
         libglib2.0-0 \
         libgomp1 \
-    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
-       | tee /etc/apt/sources.list.d/google-cloud-sdk.list \
-    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-       | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
-    && apt-get update && apt-get install -y --no-install-recommends \
-        google-cloud-cli \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -33,15 +26,12 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# download model ONNX dari GCS saat build
-# ARG GCS_BUCKET supaya bisa di-override: --build-arg GCS_BUCKET=nama-bucket
+# download model ONNX dari GCS saat build (karena bucket public, cukup pakai curl)
 ARG GCS_BUCKET=ml-models-iot
 RUN mkdir -p /app/models && \
-    gsutil -m cp \
-      gs://${GCS_BUCKET}/det_10g.onnx \
-      gs://${GCS_BUCKET}/w600k_r50.onnx \
-      gs://${GCS_BUCKET}/genderage.onnx \
-      /app/models/
+    curl -o /app/models/det_10g.onnx   https://storage.googleapis.com/${GCS_BUCKET}/det_10g.onnx && \
+    curl -o /app/models/w600k_r50.onnx https://storage.googleapis.com/${GCS_BUCKET}/w600k_r50.onnx && \
+    curl -o /app/models/genderage.onnx https://storage.googleapis.com/${GCS_BUCKET}/genderage.onnx
 
 # copy source ml-service
 COPY app     ./app

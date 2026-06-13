@@ -1,17 +1,14 @@
 # ml-service/app/services/face_service.py
 #
-# -> handling business logic face recognition
-#    -> register_face  : proses 3 foto, validasi same person, simpan embedding ke DB
-#    -> infer_face     : proses 1 foto, cari best match dari semua embedding di DB
-# -> orkestrasi antara InsightFacePipeline, database connection, dan validasi
-# -> semua error dilempar sebagai ValueError atau RuntimeError yang ditangkap di router
+# -> handling business logic face recognition (Stateless)
+#    -> register_face  : proses 3 foto, validasi same person, kembalikan 3 embedding array
+#    -> infer_face     : proses 1 foto, kembalikan 1 embedding array
+# -> tidak ada koneksi database di sini (pure compute node)
+# -> semua error dilempar sebagai ValueError yang ditangkap di router
 
-import json
 import numpy as np
 import cv2
 from app.models.face_pipeline import InsightFacePipeline, cosine_similarity
-from app.database.connection import fetch_all, execute_batch, execute_returning
-
 
 # helper ---------------------------------------------------------------------------------
 
@@ -26,26 +23,6 @@ def _bytes_to_bgr(photo_bytes: bytes) -> np.ndarray:
         raise ValueError("Gagal decode gambar - pastikan format JPEG atau PNG")
     return img
 
-
-# fungsi load semua embedding dari database
-# output : list of { person_name, user_id, embedding: list[float] }
-def _load_all_embeddings() -> list[dict]:
-    rows = fetch_all(
-        "SELECT person_name, user_id, embedding FROM face_embeddings"
-    )
-    result = []
-    for row in rows:
-        try:
-            emb = json.loads(row["embedding"])
-            result.append({
-                "person_name": row["person_name"],
-                "user_id":     row["user_id"],
-                "embedding":   emb,
-            })
-        except (json.JSONDecodeError, TypeError):
-            continue
-    return result
-
 # end of helper --------------------------------------------------------------------------
 
 
@@ -56,21 +33,16 @@ def _load_all_embeddings() -> list[dict]:
 # fungsi utama registrasi wajah dari 3 foto
 # input param : pipeline    -> InsightFacePipeline instance (sudah loaded)
 #               photos      -> list of bytes [photo1, photo2, photo3]
-#               person_name -> str nama orang yang didaftarkan
-#               user_id     -> int atau None (opsional, link ke tabel users)
 #               det_threshold  -> float confidence detection (default 0.5)
 #               sim_threshold  -> float min similarity antar foto (default 0.40)
 # output : dict {
-#   person_name : str
-#   embeddings_saved : int
-#   similarity_scores : list[float]  -> sim foto1 vs foto2, foto1 vs foto3
+#   embeddings        : list[list[float]] -> 3 array embedding (tiap array isi 512 float)
+#   similarity_scores : list[float]       -> sim foto1 vs foto2, foto1 vs foto3
 # }
 # error  : ValueError jika wajah tidak terdeteksi atau foto tidak sama orang
 def register_face(
     pipeline: InsightFacePipeline,
     photos: list[bytes],
-    person_name: str,
-    user_id: int | None = None,
     det_threshold: float = 0.5,
     sim_threshold: float = 0.40,
 ) -> dict:
@@ -105,26 +77,10 @@ def register_face(
                     f"Pastikan ketiga foto adalah orang yang sama."
                 )
 
-        embeddings.append(emb)
-
-    # simpan semua embedding ke database
-    # format: (person_name, user_id, embedding_json, photo_index)
-    batch_params = [
-        (person_name, user_id, json.dumps(emb.tolist()), idx + 1)
-        for idx, emb in enumerate(embeddings)
-    ]
-
-    execute_batch(
-        """
-        INSERT INTO face_embeddings (person_name, user_id, embedding, photo_index)
-        VALUES (%s, %s, %s, %s)
-        """,
-        batch_params,
-    )
+        embeddings.append(emb.tolist())
 
     return {
-        "person_name":      person_name,
-        "embeddings_saved": len(embeddings),
+        "embeddings": embeddings,
         "similarity_scores": similarity_scores,
     }
 
@@ -136,13 +92,9 @@ def register_face(
 # fungsi utama inference wajah dari 1 foto
 # input param : pipeline       -> InsightFacePipeline instance
 #               photo_bytes    -> bytes raw foto
-#               match_threshold -> float min cosine similarity (default 0.40)
 #               det_threshold  -> float min detection confidence (default 0.5)
 # output : dict {
-#   matched     : bool
-#   person_name : str
-#   user_id     : int atau None
-#   similarity  : float
+#   embedding   : list[float] -> 512 dimensi
 #   gender      : str
 #   age         : int
 #   bbox        : [x1, y1, x2, y2]
@@ -152,7 +104,6 @@ def register_face(
 def infer_face(
     pipeline: InsightFacePipeline,
     photo_bytes: bytes,
-    match_threshold: float = 0.40,
     det_threshold: float = 0.5,
 ) -> dict:
     img    = _bytes_to_bgr(photo_bytes)
@@ -161,17 +112,8 @@ def infer_face(
     if result is None:
         raise ValueError("Wajah tidak terdeteksi di foto yang diberikan")
 
-    query_emb = result["embedding"]
-
-    # load semua embedding dari DB dan cari best match
-    db_entries = _load_all_embeddings()
-    match      = pipeline.match_face(query_emb, db_entries, threshold=match_threshold)
-
     return {
-        "matched":     match["matched"],
-        "person_name": match["person_name"],
-        "user_id":     match["user_id"],
-        "similarity":  round(float(match["similarity"]), 4),
+        "embedding":   result["embedding"].tolist(),
         "gender":      result["gender"],
         "age":         result["age"],
         "bbox":        [round(v, 1) for v in result["bbox"]],

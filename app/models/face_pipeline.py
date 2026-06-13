@@ -114,7 +114,7 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.4) -> n
         xx2 = np.minimum(x2[i], x2[order[1:]])
         yy2 = np.minimum(y2[i], y2[order[1:]])
         inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        iou   = inter / (areas[i] + areas[order[1:]] - inter)
+        iou   = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
         order = order[1:][iou <= iou_threshold]
 
     return np.array(keep, dtype=np.int32)
@@ -158,13 +158,45 @@ class FaceDetector:
         blob = blob.transpose(2, 0, 1)[np.newaxis, :]
 
         outputs  = self.session.run(None, {self.input_name: blob})
-        out_names = [o.name for o in self.session.get_outputs()]
-        out_map  = {name: val for name, val in zip(out_names, outputs)}
+        
+        # Mapping output ONNX dinamis berdasarkan shape untuk menghindari KeyError
+        # Scores: shape [N, 1] -> N = 12800 (stride 8), 3200 (stride 16), 800 (stride 32)
+        # Bbox  : shape [N, 4]
+        # Kps   : shape [N, 10]
+        
+        score_maps = {}
+        bbox_maps  = {}
+        kps_maps   = {}
+        
+        for out in outputs:
+            shape = out.shape
+            if len(shape) == 2:
+                N = shape[0]
+                # tentukan stride berdasarkan N
+                # 640x640 input -> stride 8 = 80x80 = 6400 * 2 anchors = 12800
+                if N == 12800:
+                    stride = 8
+                elif N == 3200:
+                    stride = 16
+                elif N == 800:
+                    stride = 32
+                else:
+                    continue
+                
+                if shape[1] == 1:
+                    score_maps[stride] = out
+                elif shape[1] == 4:
+                    bbox_maps[stride] = out
+                elif shape[1] == 10:
+                    kps_maps[stride] = out
 
         all_boxes, all_scores, all_kps = [], [], []
 
         for stride in STRIDES:
-            scores_raw = out_map[f"score_{stride}"].reshape(-1)
+            if stride not in score_maps or stride not in bbox_maps or stride not in kps_maps:
+                continue
+
+            scores_raw = score_maps[stride].reshape(-1)
             scores     = 1.0 / (1.0 + np.exp(-scores_raw))  # sigmoid
             keep_idx   = np.where(scores >= threshold)[0]
 
@@ -176,10 +208,10 @@ class FaceDetector:
             feat_w  = det_w // stride
             anchors = _generate_anchors(feat_h, feat_w, stride).reshape(-1, 2)[keep_idx]
 
-            bbox_raw = out_map[f"bbox_{stride}"].reshape(-1, 4)[keep_idx]
+            bbox_raw = bbox_maps[stride].reshape(-1, 4)[keep_idx]
             boxes    = _decode_boxes(bbox_raw, anchors, stride)
 
-            kps_raw = out_map[f"kps_{stride}"].reshape(-1, 10)[keep_idx]
+            kps_raw = kps_maps[stride].reshape(-1, 10)[keep_idx]
             kps     = _decode_keypoints(kps_raw, anchors, stride)
 
             all_boxes.append(boxes)
